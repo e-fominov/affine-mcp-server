@@ -132,6 +132,54 @@ function createInitialWorkspaceData(workspaceName: string = 'New Workspace') {
 }
 
 export function registerWorkspaceTools(server: McpServer, gql: GraphQLClient) {
+  // GET WORKSPACE MEMBERS
+  const getWorkspaceMembersHandler = async (parsed: { workspaceId: string }) => {
+    const query = `
+      query GetWorkspaceMembers($workspaceId: String!) {
+        workspace(id: $workspaceId) {
+          id
+          members {
+            id
+            name
+            email
+            avatarUrl
+            permission
+          }
+        }
+      }
+    `;
+    try {
+      const data = await gql.request<{ workspace: any }>(query, { workspaceId: parsed.workspaceId });
+      return text(data.workspace?.members || []);
+    } catch (error) {
+      return text({ error: String(error), members: [] });
+    }
+  };
+
+  server.registerTool(
+    "get_workspace_members",
+    {
+      title: "Get Workspace Members",
+      description: "Get list of workspace members with their names and IDs",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace ID")
+      }
+    },
+    getWorkspaceMembersHandler as any
+  );
+
+  server.registerTool(
+    "affine_get_workspace_members",
+    {
+      title: "Get Workspace Members",
+      description: "Get list of workspace members with their names and IDs",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace ID")
+      }
+    },
+    getWorkspaceMembersHandler as any
+  );
+
   // LIST WORKSPACES
   const listWorkspacesHandler = async () => {
     try {

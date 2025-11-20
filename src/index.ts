@@ -15,6 +15,7 @@ import { registerBlobTools } from "./tools/blobStorage.js";
 import { registerNotificationTools } from "./tools/notifications.js";
 import { loginWithPassword } from "./auth.js";
 import { registerAuthTools } from "./tools/auth.js";
+import { registerDatabaseTools } from "./tools/database.js";
 
 const config = loadConfig();
 
@@ -73,6 +74,7 @@ async function buildServer() {
   registerBlobTools(server, gql);
   registerNotificationTools(server, gql);
   registerAuthTools(server, gql, config.baseUrl);
+  registerDatabaseTools(server, gql, { workspaceId: config.defaultWorkspaceId });
   return server;
 }
 
