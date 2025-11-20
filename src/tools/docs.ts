@@ -526,4 +526,308 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
     deleteDocHandler as any
   );
+
+  // READ DOC CONTENT (full Yjs structure)
+  const readDocContentHandler = async (parsed: { workspaceId?: string; docId: string; parseBlocks?: boolean }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error('workspaceId is required');
+    const { endpoint, cookie } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+
+      if (!snapshot.missing) {
+        return text({ docId: parsed.docId, empty: true, blocks: [] });
+      }
+
+      // Decode Yjs content
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, 'base64'));
+
+      const blocks = doc.getMap('blocks') as Y.Map<any>;
+      const meta = doc.getMap('meta') as Y.Map<any>;
+
+      // Extract metadata
+      const metadata: any = {};
+      for (const [key, value] of meta) {
+        metadata[key] = value;
+      }
+
+      // Parse blocks if requested
+      if (parsed.parseBlocks) {
+        const parsedBlocks: any[] = [];
+        for (const [blockId, block] of blocks) {
+          if (block && typeof block.get === 'function') {
+            const blockData: any = { id: blockId };
+            // Get all properties from the YMap
+            for (const key of block.keys()) {
+              const value = block.get(key);
+              // Handle different Yjs types
+              if (value && typeof value.toString === 'function') {
+                blockData[key] = value.toString();
+              } else if (value && typeof value.toJSON === 'function') {
+                blockData[key] = value.toJSON();
+              } else {
+                blockData[key] = value;
+              }
+            }
+            parsedBlocks.push(blockData);
+          }
+        }
+        return text({ docId: parsed.docId, metadata, blocks: parsedBlocks, totalBlocks: parsedBlocks.length });
+      }
+
+      // Return raw block IDs and flavours
+      const blockSummary: any[] = [];
+      for (const [blockId, block] of blocks) {
+        if (block && typeof block.get === 'function') {
+          blockSummary.push({
+            id: blockId,
+            flavour: block.get('sys:flavour'),
+            hasText: block.has('prop:text'),
+            hasChildren: block.has('sys:children')
+          });
+        }
+      }
+
+      return text({
+        docId: parsed.docId,
+        metadata,
+        blockCount: blockSummary.length,
+        blocks: blockSummary
+      });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool(
+    'read_doc_content',
+    {
+      title: 'Read Document Content',
+      description: 'Read full Yjs document content with all blocks',
+      inputSchema: {
+        workspaceId: z.string().optional(),
+        docId: z.string(),
+        parseBlocks: z.boolean().optional().describe('Parse full block details (default: false)')
+      },
+    },
+    readDocContentHandler as any
+  );
+  server.registerTool(
+    'affine_read_doc_content',
+    {
+      title: 'Read Document Content',
+      description: 'Read full Yjs document content with all blocks',
+      inputSchema: {
+        workspaceId: z.string().optional(),
+        docId: z.string(),
+        parseBlocks: z.boolean().optional().describe('Parse full block details (default: false)')
+      },
+    },
+    readDocContentHandler as any
+  );
+
+  // LIST DATABASES (find all database documents)
+  const listDatabasesHandler = async (parsed: { workspaceId?: string; limit?: number }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error('workspaceId is required');
+
+    const { endpoint, cookie } = await getCookieAndEndpoint();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, cookie);
+
+    try {
+      await joinWorkspace(socket, workspaceId);
+
+      // Get all docs from GraphQL
+      const query = `query ListDocs($workspaceId: String!, $first: Int){ workspace(id:$workspaceId){ docs(pagination:{first:$first}){ totalCount edges{ node{ id title createdAt updatedAt } } } } }`;
+      const data = await gql.request<{ workspace: any }>(query, { workspaceId, first: parsed.limit || 100 });
+
+      const databases: any[] = [];
+
+      // Check each document for database blocks
+      for (const edge of data.workspace.docs.edges) {
+        const docId = edge.node.id;
+
+        try {
+          const snapshot = await loadDoc(socket, workspaceId, docId);
+          if (!snapshot.missing) continue;
+
+          const doc = new Y.Doc();
+          Y.applyUpdate(doc, Buffer.from(snapshot.missing, 'base64'));
+
+          const blocks = doc.getMap('blocks') as Y.Map<any>;
+
+          // Check if document has database block
+          let hasDatabase = false;
+          let dbTitle = '';
+          let dbBlockId = '';
+
+          for (const [blockId, block] of blocks) {
+            if (block && typeof block.get === 'function') {
+              const flavour = block.get('sys:flavour');
+              if (flavour && flavour.includes('database')) {
+                hasDatabase = true;
+                dbTitle = block.get('prop:title')?.toString() || edge.node.title;
+                dbBlockId = blockId;
+                break;
+              }
+            }
+          }
+
+          if (hasDatabase) {
+            databases.push({
+              docId: docId,
+              title: edge.node.title,
+              databaseTitle: dbTitle,
+              databaseId: dbBlockId,
+              createdAt: edge.node.createdAt,
+              updatedAt: edge.node.updatedAt
+            });
+          }
+        } catch (err) {
+          // Skip docs that can't be loaded
+          continue;
+        }
+      }
+
+      return text({
+        workspaceId,
+        databases,
+        count: databases.length,
+        totalDocs: data.workspace.docs.totalCount
+      });
+
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  server.registerTool(
+    'list_databases',
+    {
+      title: 'List Databases',
+      description: 'Find all database documents in workspace',
+      inputSchema: {
+        workspaceId: z.string().optional(),
+        limit: z.number().optional().describe('Max documents to check (default: 100)')
+      },
+    },
+    listDatabasesHandler as any
+  );
+
+  server.registerTool(
+    'affine_list_databases',
+    {
+      title: 'List Databases',
+      description: 'Find all database documents in workspace',
+      inputSchema: {
+        workspaceId: z.string().optional(),
+        limit: z.number().optional().describe('Max documents to check (default: 100)')
+      },
+    },
+    listDatabasesHandler as any
+  );
+
+  // BULK FETCH DOCS (with optional content)
+  const bulkFetchDocsHandler = async (parsed: { workspaceId?: string; includeContent?: boolean; pageSize?: number }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error('workspaceId is required');
+
+    const allDocs: any[] = [];
+    let hasMore = true;
+    let offset = 0;
+    const pageSize = parsed.pageSize || 50;
+
+    while (hasMore) {
+      const query = `query ListDocs($workspaceId: String!, $first: Int, $offset: Int){ workspace(id:$workspaceId){ docs(pagination:{first:$first, offset:$offset}){ totalCount pageInfo{ hasNextPage } edges{ node{ id workspaceId title summary public defaultRole createdAt updatedAt } } } } }`;
+      const data = await gql.request<{ workspace: any }>(query, { workspaceId, first: pageSize, offset });
+
+      for (const edge of data.workspace.docs.edges) {
+        allDocs.push(edge.node);
+      }
+
+      hasMore = data.workspace.docs.pageInfo.hasNextPage;
+      offset += pageSize;
+    }
+
+    // Include content if requested
+    if (parsed.includeContent) {
+      const { endpoint, cookie } = await getCookieAndEndpoint();
+      const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+      const socket = await connectWorkspaceSocket(wsUrl, cookie);
+
+      try {
+        await joinWorkspace(socket, workspaceId);
+
+        for (const doc of allDocs) {
+          try {
+            const snapshot = await loadDoc(socket, workspaceId, doc.id);
+            if (snapshot.missing) {
+              const ydoc = new Y.Doc();
+              Y.applyUpdate(ydoc, Buffer.from(snapshot.missing, 'base64'));
+
+              const blocks = ydoc.getMap('blocks') as Y.Map<any>;
+              const blockSummary: any[] = [];
+
+              for (const [blockId, block] of blocks) {
+                if (block && typeof block.get === 'function') {
+                  blockSummary.push({
+                    id: blockId,
+                    flavour: block.get('sys:flavour')
+                  });
+                }
+              }
+
+              doc.blockCount = blockSummary.length;
+              doc.hasDatabase = blockSummary.some(b => b.flavour?.includes('database'));
+            }
+          } catch (err) {
+            doc.contentError = true;
+          }
+        }
+
+        socket.disconnect();
+      } catch (err) {
+        // Continue without content if WebSocket fails
+      }
+    }
+
+    return text({
+      workspaceId,
+      docs: allDocs,
+      total: allDocs.length,
+      includeContent: parsed.includeContent || false
+    });
+  };
+
+  server.registerTool(
+    'bulk_fetch_docs',
+    {
+      title: 'Bulk Fetch Documents',
+      description: 'Fetch all documents in workspace with pagination',
+      inputSchema: {
+        workspaceId: z.string().optional(),
+        includeContent: z.boolean().optional().describe('Include content summary (slower)'),
+        pageSize: z.number().optional().describe('Page size for pagination (default: 50)')
+      },
+    },
+    bulkFetchDocsHandler as any
+  );
+
+  server.registerTool(
+    'affine_bulk_fetch_docs',
+    {
+      title: 'Bulk Fetch Documents',
+      description: 'Fetch all documents in workspace with pagination',
+      inputSchema: {
+        workspaceId: z.string().optional(),
+        includeContent: z.boolean().optional().describe('Include content summary (slower)'),
+        pageSize: z.number().optional().describe('Page size for pagination (default: 50)')
+      },
+    },
+    bulkFetchDocsHandler as any
+  );
 }
